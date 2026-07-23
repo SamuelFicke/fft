@@ -1,0 +1,6 @@
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <property name="random_seed" value="1784829410" />
+    <testcase name="test_fft_matches_reference" classname="test_fft_mdf" file="/home/sficke/github/fft/tests/test_fft_mdf.py" lineno="179" time="0.01167917251586914" sim_time_ns="400.0" ratio_time="34249.00175560364" />
+  </testsuite>
+</testsuites>
