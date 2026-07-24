@@ -56,13 +56,10 @@ architecture rtl of fft_mdf is
   type t_stage_frame_array is array (natural range <>) of t_complex_array(0 to G_FFT_SIZE - 1);
   type t_logic_array is array (natural range <>) of std_logic;
 
-  signal Frame_A_Buffer_R    : t_complex_array(0 to G_FFT_SIZE - 1) := (others => C_ZERO_SAMPLE);
-  signal Frame_B_Buffer_R    : t_complex_array(0 to G_FFT_SIZE - 1) := (others => C_ZERO_SAMPLE);
+  signal Frame_Buffer_R      : t_complex_array(0 to G_FFT_SIZE - 1) := (others => C_ZERO_SAMPLE);
   signal Input_Word_Count_R  : integer range 0 to G_FFT_SIZE - 1 := 0;
   signal Output_Word_Count_R : integer range 0 to G_FFT_SIZE - 1 := 0;
-  signal Frame_A_Ready_R     : std_logic := '0';
-  signal Frame_B_Ready_R     : std_logic := '0';
-  signal Capture_Buffer_R    : std_logic := '0';
+  signal Frame_Ready_R       : std_logic := '0';
   signal Stage0_Frame_In_R   : t_complex_array(0 to G_FFT_SIZE - 1) := (others => C_ZERO_SAMPLE);
   signal Stage0_Frame_In_V_R : std_logic := '0';
   signal Stage_Frame_R       : t_stage_frame_array(0 to C_STAGES - 1) := (others => (others => C_ZERO_SAMPLE));
@@ -75,6 +72,7 @@ architecture rtl of fft_mdf is
   signal Pending_Output_Frame_R : t_complex_array(0 to G_FFT_SIZE - 1) := (others => C_ZERO_SAMPLE);
   signal Pending_Output_Ready_R : std_logic := '0';
   signal Final_Stage_Ready_S : std_logic;
+  signal Output_Stream_Active_R : std_logic := '0';
 
   signal Data_Out_I_R        : std_logic_vector(C_OUTPUT_WIDTH * G_SAMPLES_PER_CLK - 1 downto 0) := (others => '0');
   signal Data_Out_Q_R        : std_logic_vector(C_OUTPUT_WIDTH * G_SAMPLES_PER_CLK - 1 downto 0) := (others => '0');
@@ -95,7 +93,7 @@ begin
   assert G_TWIDDLE_WIDTH > 0 report "G_TWIDDLE_WIDTH must be greater than zero" severity failure;
   assert G_TWIDDLE_WIDTH >= 2 report "G_TWIDDLE_WIDTH must be at least 2 bits" severity failure;
 
-  Final_Stage_Ready_S <= '1' when (Output_Active_R = '0' or Pending_Output_Ready_R = '0') else '0';
+  Final_Stage_Ready_S <= '1' when Pending_Output_Ready_R = '0' else '0';
   Stage_Out_Ready_R(C_STAGES - 1) <= Final_Stage_Ready_S;
 
   gen_interstage_ready : for stage_idx in 0 to C_STAGES - 2 generate
@@ -117,14 +115,14 @@ begin
         G_MUL_PIPE_STAGES => 1
       )
       port map (
-        Clk            => Clk,
-        Rst            => Rst,
-        Frame_In       => Stage0_Frame_In_R,
-        Frame_In_V     => Stage0_Frame_In_V_R,
-        Frame_In_Ready => Stage_In_Ready_R(0),
-        Frame_Out      => Stage_Frame_R(0),
-        Frame_Out_V    => Stage_Frame_V_R(0),
-        Frame_Out_Ready => Stage_Out_Ready_R(0)
+        Clk             => Clk,
+        Rst             => Rst,
+        Sample_In       => C_ZERO_SAMPLE,
+        Sample_In_V     => '0',
+        Sample_In_Ready => Stage_In_Ready_R(0),
+        Sample_Out      => Stage_Frame_R(0)(0),
+        Sample_Out_V    => Stage_Frame_V_R(0),
+        Sample_Out_Ready => Stage_Out_Ready_R(0)
       );
   end generate;
 
@@ -142,21 +140,26 @@ begin
         G_MUL_PIPE_STAGES => 1
       )
       port map (
-        Clk            => Clk,
-        Rst            => Rst,
-        Frame_In       => Stage_Frame_R(stage_idx - 1),
-        Frame_In_V     => Stage_Frame_V_R(stage_idx - 1),
-        Frame_In_Ready => Stage_In_Ready_R(stage_idx),
-        Frame_Out      => Stage_Frame_R(stage_idx),
-        Frame_Out_V    => Stage_Frame_V_R(stage_idx),
-        Frame_Out_Ready => Stage_Out_Ready_R(stage_idx)
+        Clk             => Clk,
+        Rst             => Rst,
+        Sample_In       => C_ZERO_SAMPLE,
+        Sample_In_V     => '0',
+        Sample_In_Ready => Stage_In_Ready_R(stage_idx),
+        Sample_Out      => Stage_Frame_R(stage_idx)(0),
+        Sample_Out_V    => Stage_Frame_V_R(stage_idx),
+        Sample_Out_Ready => Stage_Out_Ready_R(stage_idx)
       );
   end generate;
 
   process(Clk)
-    variable sample_index     : integer;
-    variable sample_word_i    : std_logic_vector(G_DATA_WIDTH - 1 downto 0);
-    variable sample_word_q    : std_logic_vector(G_DATA_WIDTH - 1 downto 0);
+    variable sample_index         : integer;
+    variable sample_word_i        : std_logic_vector(G_DATA_WIDTH - 1 downto 0);
+    variable sample_word_q        : std_logic_vector(G_DATA_WIDTH - 1 downto 0);
+    variable output_active_v      : std_logic;
+    variable output_word_count_v  : integer range 0 to G_FFT_SIZE - 1;
+    variable pending_ready_v      : std_logic;
+    variable output_frame_v       : t_complex_array(0 to G_FFT_SIZE - 1);
+    variable pending_output_frame_v : t_complex_array(0 to G_FFT_SIZE - 1);
   begin
     if rising_edge(Clk) then
       if Rst = '1' then
@@ -165,106 +168,96 @@ begin
         Data_Out_I_R <= (others => '0');
         Data_Out_Q_R <= (others => '0');
         Data_Out_V_R <= '0';
-        Frame_A_Buffer_R <= (others => C_ZERO_SAMPLE);
-        Frame_B_Buffer_R <= (others => C_ZERO_SAMPLE);
-        Frame_A_Ready_R <= '0';
-        Frame_B_Ready_R <= '0';
-        Capture_Buffer_R <= '0';
+        Frame_Buffer_R <= (others => C_ZERO_SAMPLE);
+        Frame_Ready_R <= '0';
         Stage0_Frame_In_R <= (others => C_ZERO_SAMPLE);
         Stage0_Frame_In_V_R <= '0';
         Output_Active_R <= '0';
         Output_Frame_R <= (others => C_ZERO_SAMPLE);
         Pending_Output_Frame_R <= (others => C_ZERO_SAMPLE);
         Pending_Output_Ready_R <= '0';
+        Output_Stream_Active_R <= '0';
       else
+        output_active_v := Output_Active_R;
+        output_word_count_v := Output_Word_Count_R;
+        pending_ready_v := Pending_Output_Ready_R;
+        output_frame_v := Output_Frame_R;
+        pending_output_frame_v := Pending_Output_Frame_R;
+
         Stage0_Frame_In_V_R <= '0';
         Data_Out_V_R <= '0';
 
-        if Sample_In_V = '1' then
+        if Sample_In_V = '1' and Frame_Ready_R = '0' then
           for lane_idx in 0 to G_SAMPLES_PER_CLK - 1 loop
             sample_index := Input_Word_Count_R * G_SAMPLES_PER_CLK + lane_idx;
             if sample_index < G_FFT_SIZE then
               sample_word_i := Sample_In_I(((lane_idx + 1) * G_DATA_WIDTH) - 1 downto lane_idx * G_DATA_WIDTH);
               sample_word_q := Sample_In_Q(((lane_idx + 1) * G_DATA_WIDTH) - 1 downto lane_idx * G_DATA_WIDTH);
-              if Capture_Buffer_R = '0' then
-                Frame_A_Buffer_R(sample_index).re <= resize(signed(sample_word_i), C_FFT_INTERNAL_WIDTH);
-                Frame_A_Buffer_R(sample_index).im <= resize(signed(sample_word_q), C_FFT_INTERNAL_WIDTH);
-              else
-                Frame_B_Buffer_R(sample_index).re <= resize(signed(sample_word_i), C_FFT_INTERNAL_WIDTH);
-                Frame_B_Buffer_R(sample_index).im <= resize(signed(sample_word_q), C_FFT_INTERNAL_WIDTH);
-              end if;
+              Frame_Buffer_R(sample_index).re <= resize(signed(sample_word_i), C_FFT_INTERNAL_WIDTH);
+              Frame_Buffer_R(sample_index).im <= resize(signed(sample_word_q), C_FFT_INTERNAL_WIDTH);
             end if;
           end loop;
 
           if Input_Word_Count_R = C_INPUT_WORDS - 1 then
-            if Capture_Buffer_R = '0' then
-              assert Frame_A_Ready_R = '0' report "Input frame overflow on capture buffer A" severity failure;
-              Frame_A_Ready_R <= '1';
-            else
-              assert Frame_B_Ready_R = '0' report "Input frame overflow on capture buffer B" severity failure;
-              Frame_B_Ready_R <= '1';
-            end if;
+            assert Frame_Ready_R = '0' report "Input frame overflow" severity failure;
+            Frame_Ready_R <= '1';
             Input_Word_Count_R <= 0;
-            if Capture_Buffer_R = '0' then
-              Capture_Buffer_R <= '1';
-            else
-              Capture_Buffer_R <= '0';
-            end if;
           else
             Input_Word_Count_R <= Input_Word_Count_R + 1;
           end if;
         end if;
 
-        if Stage_In_Ready_R(0) = '1' then
-          if Frame_A_Ready_R = '1' then
-            Frame_A_Ready_R <= '0';
-            Stage0_Frame_In_R <= fft_bit_reverse_permute(Frame_A_Buffer_R);
-            Stage0_Frame_In_V_R <= '1';
-          elsif Frame_B_Ready_R = '1' then
-            Frame_B_Ready_R <= '0';
-            Stage0_Frame_In_R <= fft_bit_reverse_permute(Frame_B_Buffer_R);
-            Stage0_Frame_In_V_R <= '1';
-          end if;
+        if Stage_In_Ready_R(0) = '1' and Frame_Ready_R = '1' then
+          Frame_Ready_R <= '0';
+          Stage0_Frame_In_R <= fft_bit_reverse_permute(Frame_Buffer_R);
+          Stage0_Frame_In_V_R <= '1';
         end if;
 
         if Stage_Frame_V_R(C_STAGES - 1) = '1' and Final_Stage_Ready_S = '1' then
-          if Output_Active_R = '0' then
-            Output_Frame_R <= Stage_Frame_R(C_STAGES - 1);
-            Output_Active_R <= '1';
-            Output_Word_Count_R <= 0;
+          if output_active_v = '0' then
+            output_frame_v := Stage_Frame_R(C_STAGES - 1);
+            output_active_v := '1';
+            output_word_count_v := 0;
           else
-            Pending_Output_Frame_R <= Stage_Frame_R(C_STAGES - 1);
-            Pending_Output_Ready_R <= '1';
+            pending_output_frame_v := Stage_Frame_R(C_STAGES - 1);
+            pending_ready_v := '1';
           end if;
         end if;
 
-        if Output_Active_R = '1' then
+        if output_active_v = '1' then
           Data_Out_V_R <= '1';
           for lane_idx in 0 to G_SAMPLES_PER_CLK - 1 loop
-            sample_index := Output_Word_Count_R * G_SAMPLES_PER_CLK + lane_idx;
+            sample_index := output_word_count_v * G_SAMPLES_PER_CLK + lane_idx;
             if sample_index < G_FFT_SIZE then
-              Data_Out_I_R(((lane_idx + 1) * C_OUTPUT_WIDTH) - 1 downto lane_idx * C_OUTPUT_WIDTH) <= std_logic_vector(fft_resize_saturate(Output_Frame_R(sample_index).re, C_OUTPUT_WIDTH));
-              Data_Out_Q_R(((lane_idx + 1) * C_OUTPUT_WIDTH) - 1 downto lane_idx * C_OUTPUT_WIDTH) <= std_logic_vector(fft_resize_saturate(Output_Frame_R(sample_index).im, C_OUTPUT_WIDTH));
+              Data_Out_I_R(((lane_idx + 1) * C_OUTPUT_WIDTH) - 1 downto lane_idx * C_OUTPUT_WIDTH) <= std_logic_vector(fft_resize_saturate(output_frame_v(sample_index).re, C_OUTPUT_WIDTH));
+              Data_Out_Q_R(((lane_idx + 1) * C_OUTPUT_WIDTH) - 1 downto lane_idx * C_OUTPUT_WIDTH) <= std_logic_vector(fft_resize_saturate(output_frame_v(sample_index).im, C_OUTPUT_WIDTH));
             else
               Data_Out_I_R(((lane_idx + 1) * C_OUTPUT_WIDTH) - 1 downto lane_idx * C_OUTPUT_WIDTH) <= (others => '0');
               Data_Out_Q_R(((lane_idx + 1) * C_OUTPUT_WIDTH) - 1 downto lane_idx * C_OUTPUT_WIDTH) <= (others => '0');
             end if;
           end loop;
 
-          if Output_Word_Count_R = C_INPUT_WORDS - 1 then
-            if Pending_Output_Ready_R = '1' then
-              Output_Frame_R <= Pending_Output_Frame_R;
-              Pending_Output_Ready_R <= '0';
-              Output_Word_Count_R <= 0;
-              Output_Active_R <= '1';
+          if output_word_count_v = C_INPUT_WORDS - 1 then
+            if pending_ready_v = '1' then
+              output_frame_v := pending_output_frame_v;
+              pending_ready_v := '0';
+              output_word_count_v := 0;
+              output_active_v := '1';
             else
-              Output_Word_Count_R <= 0;
-              Output_Active_R <= '0';
+              output_word_count_v := 0;
+              output_active_v := '0';
             end if;
           else
-            Output_Word_Count_R <= Output_Word_Count_R + 1;
+            output_word_count_v := output_word_count_v + 1;
           end if;
         end if;
+
+        Output_Frame_R <= output_frame_v;
+        Pending_Output_Frame_R <= pending_output_frame_v;
+        Output_Word_Count_R <= output_word_count_v;
+        Output_Active_R <= output_active_v;
+        Pending_Output_Ready_R <= pending_ready_v;
+        Output_Stream_Active_R <= output_active_v;
       end if;
     end if;
   end process;

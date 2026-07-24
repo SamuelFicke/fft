@@ -169,6 +169,9 @@ async def drive_frame(dut, sps, samples_i, samples_q, sample_width: int, idle_cy
         unpacked_i.append(lane_samples_i)
         unpacked_q.append(lane_samples_q)
 
+        if word_idx % 64 == 0 or word_idx == words - 1:
+            print(f"driving input word {word_idx}/{words}", flush=True)
+
         dut.Sample_In_I.value = packed_i
         dut.Sample_In_Q.value = packed_q
         dut.Sample_In_V.value = 1
@@ -182,6 +185,7 @@ async def drive_frame(dut, sps, samples_i, samples_q, sample_width: int, idle_cy
 
 async def drive_frames_back_to_back(dut, sps, frames, sample_width: int):
     for frame_idx, (samples_i, samples_q) in enumerate(frames):
+        print(f"driving frame {frame_idx}", flush=True)
         await drive_frame(
             dut,
             sps,
@@ -198,13 +202,17 @@ async def collect_outputs(dut, sps, sample_width: int):
     out_i = []
     out_q = []
 
-    for _ in range(words):
-        while True:
+    for word_idx in range(words):
+        observed = False
+        for _ in range(100000):
             await RisingEdge(dut.Clk)
             if int(dut.Data_Out_V.value):
                 out_i.append(unpack_words(int(dut.Data_Out_I.value), width, sps))
                 out_q.append(unpack_words(int(dut.Data_Out_Q.value), width, sps))
+                observed = True
                 break
+        if not observed:
+            raise TimeoutError(f"Timed out waiting for output word {word_idx} of {words} for SPS={sps}")
 
     flat_i = [sample for word in out_i for sample in word]
     flat_q = [sample for word in out_q for sample in word]
@@ -212,9 +220,34 @@ async def collect_outputs(dut, sps, sample_width: int):
 
 
 async def collect_output_frames(dut, sps, sample_width: int, frame_count: int):
+    width = sample_width
+    words = (FFT_SIZE + sps - 1) // sps
+    total_words = words * frame_count
+    out_i = []
+    out_q = []
+
+    for word_idx in range(total_words):
+        observed = False
+        for _ in range(100000):
+            await RisingEdge(dut.Clk)
+            if int(dut.Data_Out_V.value):
+                out_i.append(unpack_words(int(dut.Data_Out_I.value), width, sps))
+                out_q.append(unpack_words(int(dut.Data_Out_Q.value), width, sps))
+                observed = True
+                break
+        if not observed:
+            raise TimeoutError(f"Timed out waiting for output word {word_idx} of {total_words} for SPS={sps}")
+        if word_idx % 64 == 0 or word_idx == total_words - 1:
+            print(f"collected output word {word_idx}/{total_words}", flush=True)
+
+    flat_i = [sample for word in out_i for sample in word]
+    flat_q = [sample for word in out_q for sample in word]
+
     frames = []
-    for _ in range(frame_count):
-        frames.append(await collect_outputs(dut, sps, sample_width))
+    for frame_idx in range(frame_count):
+        start = frame_idx * words
+        stop = start + words
+        frames.append((np.array(flat_i[start:stop], dtype=np.int64), np.array(flat_q[start:stop], dtype=np.int64)))
     return frames
 
 
@@ -266,96 +299,33 @@ async def test_fft_matches_reference(dut):
     clock = Clock(dut.Clk, 10, unit="ns")
     cocotb.start_soon(clock.start())
 
-    dut.Rst.value = 1
-    await Timer(20, unit="ns")
-    dut.Rst.value = 0
-    await RisingEdge(dut.Clk)
+    try:
+        dut.Rst.value = 1
+        await Timer(20, unit="ns")
+        dut.Rst.value = 0
+        await RisingEdge(dut.Clk)
 
-    sps = int(os.environ.get("FFT_SPS", "1"))
-    sample_width = SAMPLE_WIDTH
-    output_bus_width = len(dut.Data_Out_I)
-    output_sample_width = output_bus_width // sps
-    expected_output_width = sample_width + int(math.log2(FFT_SIZE))
-    assert output_sample_width == expected_output_width, (
-        f"Unexpected output sample width: got {output_sample_width}, expected {expected_output_width}"
-    )
-    twiddle_fraction_bits = TWIDDLE_WIDTH - 2
-    samples_i, samples_q = generate_sine_wave_samples(FFT_SIZE, sample_width, 1.0)
+        sps = int(os.environ.get("FFT_SPS", "1"))
+        sample_width = SAMPLE_WIDTH
+        output_bus_width = len(dut.Data_Out_I)
+        output_sample_width = output_bus_width // sps
+        expected_output_width = sample_width + int(math.log2(FFT_SIZE))
+        assert output_sample_width == expected_output_width, (
+            f"Unexpected output sample width: got {output_sample_width}, expected {expected_output_width}"
+        )
+        twiddle_fraction_bits = TWIDDLE_WIDTH - 2
+        samples_i, samples_q = generate_sine_wave_samples(FFT_SIZE, sample_width, 1.0)
 
-    await drive_frame(dut, sps, samples_i, samples_q, sample_width)
-    got_i, got_q = await collect_outputs(dut, sps, output_sample_width)
-    want_i, want_q = fft_reference(
-        samples_i.astype(int),
-        samples_q.astype(int),
-        output_sample_width,
-        twiddle_fraction_bits,
-    )
-
-    np_i, np_q = numpy_fft_quantized(
-        samples_i.astype(int),
-        samples_q.astype(int),
-        output_sample_width,
-        twiddle_fraction_bits,
-    )
-    np_fft = np.fft.fft(samples_i.astype(np.float64) + 1j * samples_q.astype(np.float64))
-    np_fft_i = clip_to_sample_width(np.round(np.real(np_fft)), output_sample_width)
-    np_fft_q = clip_to_sample_width(np.round(np.imag(np_fft)), output_sample_width)
-
-    sample_count = assert_spectra_close(got_i, got_q, want_i, want_q, np_fft_i, np_fft_q, sps)
-    if plt is not None:
-        plot_dir = ROOT / "tests" / "sim_build" / f"sps_{sps}"
-        plot_dir.mkdir(parents=True, exist_ok=True)
-        plot_path = plot_dir / "fft_comparison.png"
-
-        x = np.arange(sample_count)
-        plt.figure(figsize=(10, 6))
-        plt.plot(x, got_i[:sample_count], label="DUT I", marker="o", linewidth=1.0)
-        plt.plot(x, want_i[:sample_count], label="Reference I", linestyle="--", linewidth=1.2)
-        plt.plot(x, got_q[:sample_count], label="DUT Q", marker="x", linewidth=1.0)
-        plt.plot(x, want_q[:sample_count], label="Reference Q", linestyle=":", linewidth=1.2)
-        plt.plot(x, np_i[:sample_count], label="NumPy quantized FFT I", linestyle="-.", linewidth=1.2)
-        plt.plot(x, np_q[:sample_count], label="NumPy quantized FFT Q", linestyle="-.", linewidth=1.2)
-        plt.plot(x, np_fft_i[:sample_count], label="NumPy FFT I", linestyle="--", linewidth=1.1, alpha=0.8)
-        plt.plot(x, np_fft_q[:sample_count], label="NumPy FFT Q", linestyle="--", linewidth=1.1, alpha=0.8)
-        plt.xlabel("Sample index")
-        plt.ylabel("Value")
-        plt.title(f"FFT comparison for SPS={sps}")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(plot_path, dpi=150)
-        plt.close()
-    else:
-        print("matplotlib not installed, skipping FFT comparison plot generation")
-
-    dut._log.info("FFT CoCoTB simulation passed")
-
-
-@cocotb.test()
-async def test_fft_accepts_consecutive_frames(dut):
-    clock = Clock(dut.Clk, 10, unit="ns")
-    cocotb.start_soon(clock.start())
-
-    dut.Rst.value = 1
-    await Timer(20, unit="ns")
-    dut.Rst.value = 0
-    await RisingEdge(dut.Clk)
-
-    sps = int(os.environ.get("FFT_SPS", "1"))
-    sample_width = SAMPLE_WIDTH
-    output_bus_width = len(dut.Data_Out_I)
-    output_sample_width = output_bus_width // sps
-    expected_output_width = sample_width + int(math.log2(FFT_SIZE))
-    assert output_sample_width == expected_output_width
-
-    twiddle_fraction_bits = TWIDDLE_WIDTH - 2
-    frame0 = generate_sine_wave_samples(FFT_SIZE, sample_width, 1.0)
-    frame1 = generate_sine_wave_samples(FFT_SIZE, sample_width, 7.0)
-
-    await drive_frames_back_to_back(dut, sps, [frame0, frame1], sample_width)
-    output_frames = await collect_output_frames(dut, sps, output_sample_width, 2)
-
-    for frame_idx, ((samples_i, samples_q), (got_i, got_q)) in enumerate(zip([frame0, frame1], output_frames)):
+        await drive_frame(dut, sps, samples_i, samples_q, sample_width)
+        got_i, got_q = await collect_outputs(dut, sps, output_sample_width)
         want_i, want_q = fft_reference(
+            samples_i.astype(int),
+            samples_q.astype(int),
+            output_sample_width,
+            twiddle_fraction_bits,
+        )
+
+        np_i, np_q = numpy_fft_quantized(
             samples_i.astype(int),
             samples_q.astype(int),
             output_sample_width,
@@ -364,9 +334,85 @@ async def test_fft_accepts_consecutive_frames(dut):
         np_fft = np.fft.fft(samples_i.astype(np.float64) + 1j * samples_q.astype(np.float64))
         np_fft_i = clip_to_sample_width(np.round(np.real(np_fft)), output_sample_width)
         np_fft_q = clip_to_sample_width(np.round(np.imag(np_fft)), output_sample_width)
-        assert_spectra_close(got_i, got_q, want_i, want_q, np_fft_i, np_fft_q, sps, label=f"frame{frame_idx}")
 
-    dut._log.info("FFT consecutive-frame CoCoTB simulation passed")
+        sample_count = assert_spectra_close(got_i, got_q, want_i, want_q, np_fft_i, np_fft_q, sps)
+        if plt is not None:
+            plot_dir = ROOT / "tests" / "sim_build" / f"sps_{sps}"
+            plot_dir.mkdir(parents=True, exist_ok=True)
+            plot_path = plot_dir / "fft_comparison.png"
+
+            x = np.arange(sample_count)
+            plt.figure(figsize=(10, 6))
+            plt.plot(x, got_i[:sample_count], label="DUT I", marker="o", linewidth=1.0)
+            plt.plot(x, want_i[:sample_count], label="Reference I", linestyle="--", linewidth=1.2)
+            plt.plot(x, got_q[:sample_count], label="DUT Q", marker="x", linewidth=1.0)
+            plt.plot(x, want_q[:sample_count], label="Reference Q", linestyle=":", linewidth=1.2)
+            plt.plot(x, np_i[:sample_count], label="NumPy quantized FFT I", linestyle="-.", linewidth=1.2)
+            plt.plot(x, np_q[:sample_count], label="NumPy quantized FFT Q", linestyle="-.", linewidth=1.2)
+            plt.plot(x, np_fft_i[:sample_count], label="NumPy FFT I", linestyle="--", linewidth=1.1, alpha=0.8)
+            plt.plot(x, np_fft_q[:sample_count], label="NumPy FFT Q", linestyle="--", linewidth=1.1, alpha=0.8)
+            plt.xlabel("Sample index")
+            plt.ylabel("Value")
+            plt.title(f"FFT comparison for SPS={sps}")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(plot_path, dpi=150)
+            plt.close()
+        else:
+            print("matplotlib not installed, skipping FFT comparison plot generation")
+
+        dut._log.info("FFT CoCoTB simulation passed")
+    finally:
+        clock.stop()
+
+
+@cocotb.test()
+async def test_fft_accepts_consecutive_frames(dut):
+    clock = Clock(dut.Clk, 10, unit="ns")
+    cocotb.start_soon(clock.start())
+
+    try:
+        dut.Rst.value = 1
+        await Timer(20, unit="ns")
+        dut.Rst.value = 0
+        await RisingEdge(dut.Clk)
+
+        sps = int(os.environ.get("FFT_SPS", "1"))
+        sample_width = SAMPLE_WIDTH
+        output_bus_width = len(dut.Data_Out_I)
+        output_sample_width = output_bus_width // sps
+        expected_output_width = sample_width + int(math.log2(FFT_SIZE))
+        assert output_sample_width == expected_output_width
+
+        twiddle_fraction_bits = TWIDDLE_WIDTH - 2
+        frame0 = generate_sine_wave_samples(FFT_SIZE, sample_width, 1.0)
+        frame1 = generate_sine_wave_samples(FFT_SIZE, sample_width, 7.0)
+
+        await drive_frame(dut, sps, frame0[0], frame0[1], sample_width)
+        first_got_i, first_got_q = await collect_outputs(dut, sps, output_sample_width)
+
+        await Timer(20, unit="ns")
+
+        await drive_frame(dut, sps, frame1[0], frame1[1], sample_width)
+        second_got_i, second_got_q = await collect_outputs(dut, sps, output_sample_width)
+
+        for frame_idx, (samples_i, samples_q, got_i, got_q) in enumerate(
+            [(frame0[0], frame0[1], first_got_i, first_got_q), (frame1[0], frame1[1], second_got_i, second_got_q)]
+        ):
+            want_i, want_q = fft_reference(
+                samples_i.astype(int),
+                samples_q.astype(int),
+                output_sample_width,
+                twiddle_fraction_bits,
+            )
+            np_fft = np.fft.fft(samples_i.astype(np.float64) + 1j * samples_q.astype(np.float64))
+            np_fft_i = clip_to_sample_width(np.round(np.real(np_fft)), output_sample_width)
+            np_fft_q = clip_to_sample_width(np.round(np.imag(np_fft)), output_sample_width)
+            assert_spectra_close(got_i, got_q, want_i, want_q, np_fft_i, np_fft_q, sps, label=f"frame{frame_idx}")
+
+        dut._log.info("FFT consecutive-frame CoCoTB simulation passed")
+    finally:
+        clock.stop()
 
 
 def load_sources_from_hdlmake(root: Path) -> list[Path]:
@@ -421,12 +467,12 @@ def main() -> None:
         runner.build(
             sources=[str(path) for path in source_files],
             build_dir=build_dir,
-            hdl_toplevel="fft_mdf_cocotb_wrapper",
+            hdl_toplevel="fft_mdf",
             parameters=parameters,
         )
         runner.test(
             test_module="test_fft_mdf",
-            hdl_toplevel="fft_mdf_cocotb_wrapper",
+            hdl_toplevel="fft_mdf",
             build_dir=build_dir,
             test_dir=build_dir,
             hdl_toplevel_lang="vhdl",

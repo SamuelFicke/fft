@@ -6,7 +6,6 @@ files = [
     "utils/fft_butterfly.vhd",
     "utils/fft_stage.vhd",
     "fft_mdf.vhd",
-    "tests/fft_mdf_cocotb_wrapper.vhd",
 ]
 
-top_module = "fft_mdf_cocotb_wrapper"
+top_module = "fft_mdf"
