@@ -76,12 +76,12 @@ begin
     variable b_im_v             : signed(G_INTERNAL_WIDTH - 1 downto 0);
     variable tw_re_v            : signed(G_INTERNAL_WIDTH - 1 downto 0);
     variable tw_im_v            : signed(G_INTERNAL_WIDTH - 1 downto 0);
-    variable mul_re_wide        : signed(G_INTERNAL_WIDTH downto 0);
-    variable mul_im_wide        : signed(G_INTERNAL_WIDTH downto 0);
-    variable sum_re_wide        : signed(G_INTERNAL_WIDTH downto 0);
-    variable sum_im_wide        : signed(G_INTERNAL_WIDTH downto 0);
-    variable diff_re_wide       : signed(G_INTERNAL_WIDTH downto 0);
-    variable diff_im_wide       : signed(G_INTERNAL_WIDTH downto 0);
+    variable mul_re_wide        : signed(2 * G_INTERNAL_WIDTH downto 0);
+    variable mul_im_wide        : signed(2 * G_INTERNAL_WIDTH downto 0);
+    variable sum_re_wide        : signed(2 * G_INTERNAL_WIDTH downto 0);
+    variable sum_im_wide        : signed(2 * G_INTERNAL_WIDTH downto 0);
+    variable diff_re_wide       : signed(2 * G_INTERNAL_WIDTH downto 0);
+    variable diff_im_wide       : signed(2 * G_INTERNAL_WIDTH downto 0);
   begin
     if rising_edge(Clk) then
       if Rst = '1' then
@@ -131,12 +131,12 @@ begin
             tw_re_v := twiddle_v.re;
             tw_im_v := twiddle_v.im;
 
-            mul_re_wide := resize(shift_right(b_re_v * tw_re_v, C_TWIDDLE_FRACTION_BITS), G_INTERNAL_WIDTH + 1);
-            mul_im_wide := resize(shift_right(b_im_v * tw_im_v, C_TWIDDLE_FRACTION_BITS), G_INTERNAL_WIDTH + 1);
-            sum_re_wide := resize(a_re_v, G_INTERNAL_WIDTH + 1) + mul_re_wide;
-            sum_im_wide := resize(a_im_v, G_INTERNAL_WIDTH + 1) + mul_im_wide;
-            diff_re_wide := resize(a_re_v, G_INTERNAL_WIDTH + 1) - mul_re_wide;
-            diff_im_wide := resize(a_im_v, G_INTERNAL_WIDTH + 1) - mul_im_wide;
+            mul_re_wide := resize(shift_right((b_re_v * tw_re_v) - (b_im_v * tw_im_v), C_TWIDDLE_FRACTION_BITS), 2 * G_INTERNAL_WIDTH + 1);
+            mul_im_wide := resize(shift_right((b_re_v * tw_im_v) + (b_im_v * tw_re_v), C_TWIDDLE_FRACTION_BITS), 2 * G_INTERNAL_WIDTH + 1);
+            sum_re_wide := resize(a_re_v, 2 * G_INTERNAL_WIDTH + 1) + mul_re_wide;
+            sum_im_wide := resize(a_im_v, 2 * G_INTERNAL_WIDTH + 1) + mul_im_wide;
+            diff_re_wide := resize(a_re_v, 2 * G_INTERNAL_WIDTH + 1) - mul_re_wide;
+            diff_im_wide := resize(a_im_v, 2 * G_INTERNAL_WIDTH + 1) - mul_im_wide;
 
             stage_frame_v(idx_a_v).re := fft_resize_saturate(resize(sum_re_wide, G_INTERNAL_WIDTH), G_INTERNAL_WIDTH);
             stage_frame_v(idx_a_v).im := fft_resize_saturate(resize(sum_im_wide, G_INTERNAL_WIDTH), G_INTERNAL_WIDTH);
@@ -154,9 +154,6 @@ begin
           Sample_Out <= Output_Frame_R(Output_Count_R);
           Sample_Out_V_R <= '1';
           Output_Count_R <= Output_Count_R + 1;
-          if Output_Count_R = G_FFT_SIZE - 2 then
-            Output_Ready_R <= '0';
-          end if;
         elsif Output_Ready_R = '1' and Sample_Out_Ready = '1' and Output_Count_R = G_FFT_SIZE - 1 then
           Sample_Out <= Output_Frame_R(Output_Count_R);
           Sample_Out_V_R <= '1';
