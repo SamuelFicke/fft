@@ -18,7 +18,7 @@ from cocotb.triggers import RisingEdge, Timer
 from cocotb_tools.runner import Ghdl
 
 
-FFT_SIZE = 1024
+FFT_SIZE = int(os.environ.get("FFT_SIZE_OVERRIDE", "1024"))
 SAMPLE_WIDTH = 16
 TWIDDLE_WIDTH = 16
 SPS_VALUES = [1, 2, 4, 8]
@@ -453,7 +453,13 @@ def main() -> None:
     source_files = load_sources_from_hdlmake(root)
 
     runner = Ghdl()
-    for sps in SPS_VALUES:
+    sps_override = os.environ.get("FFT_SPS")
+    if sps_override is not None:
+        sps_values = [int(sps_override)]
+    else:
+        sps_values = SPS_VALUES
+
+    for sps in sps_values:
         parameters = {
             "G_SAMPLE_WIDTH": SAMPLE_WIDTH,
             "G_TWIDDLE_WIDTH": TWIDDLE_WIDTH,

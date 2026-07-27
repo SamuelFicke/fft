@@ -54,30 +54,24 @@ architecture rtl of fft_mdf is
   constant C_OUTPUT_WORDS : integer := (G_FFT_SIZE + G_SAMPLES_PER_CLK - 1) / G_SAMPLES_PER_CLK;
   constant C_STAGE_BUTTERFLY_LANES : integer := min_int(G_FFT_SIZE / 2, max_int(1, C_STAGES * G_SAMPLES_PER_CLK));
   constant C_ZERO_SAMPLE : t_complex_sample := ((others => '0'), (others => '0'));
-  type t_pipeline_state is (S_IDLE, S_STREAM_INPUT, S_STREAM_OUTPUT, S_EMIT_OUTPUT);
   type t_logic_array is array (natural range <>) of std_logic;
-  type t_stage_frame_array is array (natural range <>) of t_complex_array(0 to G_FFT_SIZE - 1);
 
-  signal Frame_Buffer_R         : t_complex_array(0 to G_FFT_SIZE - 1) := (others => C_ZERO_SAMPLE);
+  -- C_STAGES pipelined fft_stage units are chained back to back below, each
+  -- with its own ping-pong buffering (see fft_stage.vhd), so that multiple
+  -- frames can be in flight concurrently -- one per stage -- instead of a
+  -- single state machine reusing one stage's hardware at a time. This
+  -- matches the continuous-flow, all-stages-active pipelined FFT model
+  -- described in Garrido's MDF architecture survey.
+  signal Stage_Sample     : t_complex_array(0 to C_STAGES) := (others => C_ZERO_SAMPLE);
+  signal Stage_Valid      : t_logic_array(0 to C_STAGES) := (others => '0');
+  signal Stage_Ready       : t_logic_array(0 to C_STAGES) := (others => '0');
+
   signal Input_Word_Count_R     : integer range 0 to G_FFT_SIZE - 1 := 0;
-  signal Frame_Ready_R          : std_logic := '0';
+  signal Input_Frame_R          : t_complex_array(0 to G_FFT_SIZE - 1) := (others => C_ZERO_SAMPLE);
+  signal Input_Frame_Ready_R    : std_logic := '0';
+  signal Input_Stream_Count_R   : integer range 0 to G_FFT_SIZE - 1 := 0;
+  signal Input_Streaming_R      : std_logic := '0';
 
-  signal Stage_Input_Frame_R    : t_complex_array(0 to G_FFT_SIZE - 1) := (others => C_ZERO_SAMPLE);
-  signal Stage_Input_Count_R    : integer range 0 to G_FFT_SIZE - 1 := 0;
-  signal Stage_Output_Count_R   : integer range 0 to G_FFT_SIZE - 1 := 0;
-  signal Stage_Frame_R          : t_stage_frame_array(0 to C_STAGES - 1) := (others => (others => C_ZERO_SAMPLE));
-  signal Output_Frame_R         : t_complex_array(0 to G_FFT_SIZE - 1) := (others => C_ZERO_SAMPLE);
-  signal Pipeline_State_R       : t_pipeline_state := S_IDLE;
-  signal Current_Stage_R        : integer range 0 to C_STAGES - 1 := 0;
-
-  signal Stage_Input_Sample_R   : t_complex_array(0 to C_STAGES - 1) := (others => C_ZERO_SAMPLE);
-  signal Stage_Input_Valid_R    : t_logic_array(0 to C_STAGES - 1) := (others => '0');
-  signal Stage_Input_Ready_S    : t_logic_array(0 to C_STAGES - 1) := (others => '0');
-  signal Stage_Output_Sample_R  : t_complex_array(0 to C_STAGES - 1) := (others => C_ZERO_SAMPLE);
-  signal Stage_Output_Valid_R   : t_logic_array(0 to C_STAGES - 1) := (others => '0');
-  signal Stage_Output_Ready_R   : t_logic_array(0 to C_STAGES - 1) := (others => '0');
-
-  signal Output_Sample_Count_R  : integer range 0 to G_FFT_SIZE - 1 := 0;
   signal Output_Lane_Count_R    : integer range 0 to G_SAMPLES_PER_CLK - 1 := 0;
   signal Data_Out_I_R           : std_logic_vector(C_OUTPUT_WIDTH * G_SAMPLES_PER_CLK - 1 downto 0) := (others => '0');
   signal Data_Out_Q_R           : std_logic_vector(C_OUTPUT_WIDTH * G_SAMPLES_PER_CLK - 1 downto 0) := (others => '0');
@@ -112,132 +106,108 @@ begin
         G_MUL_PIPE_STAGES => 1
       )
       port map (
-        Clk             => Clk,
-        Rst             => Rst,
-        Sample_In       => Stage_Input_Sample_R(stage_idx),
-        Sample_In_V     => Stage_Input_Valid_R(stage_idx),
-        Sample_In_Ready => Stage_Input_Ready_S(stage_idx),
-        Sample_Out      => Stage_Output_Sample_R(stage_idx),
-        Sample_Out_V    => Stage_Output_Valid_R(stage_idx),
-        Sample_Out_Ready => Stage_Output_Ready_R(stage_idx)
+        Clk              => Clk,
+        Rst              => Rst,
+        Sample_In        => Stage_Sample(stage_idx),
+        Sample_In_V      => Stage_Valid(stage_idx),
+        Sample_In_Ready  => Stage_Ready(stage_idx),
+        Sample_Out       => Stage_Sample(stage_idx + 1),
+        Sample_Out_V     => Stage_Valid(stage_idx + 1),
+        Sample_Out_Ready => Stage_Ready(stage_idx + 1)
       );
   end generate;
+
+  -- The last stage's output is always accepted immediately: it feeds
+  -- straight into the output-emission logic below, which simply packs
+  -- each incoming sample onto the wide output bus lane by lane.
+  Stage_Ready(C_STAGES) <= '1';
 
   process(Clk)
     variable sample_index         : integer;
     variable sample_word_i        : std_logic_vector(G_DATA_WIDTH - 1 downto 0);
     variable sample_word_q        : std_logic_vector(G_DATA_WIDTH - 1 downto 0);
-    variable lane_idx             : integer;
+    variable bitrev_frame_v       : t_complex_array(0 to G_FFT_SIZE - 1);
   begin
     if rising_edge(Clk) then
       if Rst = '1' then
         Input_Word_Count_R <= 0;
-        Frame_Ready_R <= '0';
-        Stage_Input_Count_R <= 0;
-        Stage_Output_Count_R <= 0;
-        Stage_Input_Frame_R <= (others => C_ZERO_SAMPLE);
-        Stage_Frame_R <= (others => (others => C_ZERO_SAMPLE));
-        Output_Frame_R <= (others => C_ZERO_SAMPLE);
-        Pipeline_State_R <= S_IDLE;
-        Current_Stage_R <= 0;
-        Stage_Input_Valid_R <= (others => '0');
-        Stage_Input_Sample_R <= (others => C_ZERO_SAMPLE);
-        Output_Sample_Count_R <= 0;
+        Input_Frame_R <= (others => C_ZERO_SAMPLE);
+        Input_Frame_Ready_R <= '0';
+        Input_Stream_Count_R <= 0;
+        Input_Streaming_R <= '0';
+        Stage_Valid(0) <= '0';
+        Stage_Sample(0) <= C_ZERO_SAMPLE;
         Output_Lane_Count_R <= 0;
         Data_Out_I_R <= (others => '0');
         Data_Out_Q_R <= (others => '0');
         Data_Out_V_R <= '0';
       else
-        Stage_Input_Valid_R <= (others => '0');
+        Stage_Valid(0) <= '0';
         Data_Out_V_R <= '0';
-        Stage_Output_Ready_R <= (others => '0');
 
-        if Sample_In_V = '1' and Frame_Ready_R = '0' and Pipeline_State_R = S_IDLE then
+        -- Capture an incoming frame into a local buffer, one word (of
+        -- G_SAMPLES_PER_CLK samples) per cycle. This can happen while a
+        -- previous frame is still being streamed into stage 0, as long as
+        -- that previous frame has already finished being copied into
+        -- Input_Frame_R (Input_Frame_Ready_R='0').
+        if Sample_In_V = '1' and Input_Frame_Ready_R = '0' then
           for lane_idx in 0 to G_SAMPLES_PER_CLK - 1 loop
             sample_index := Input_Word_Count_R * G_SAMPLES_PER_CLK + lane_idx;
             if sample_index < G_FFT_SIZE then
               sample_word_i := Sample_In_I(((lane_idx + 1) * G_DATA_WIDTH) - 1 downto lane_idx * G_DATA_WIDTH);
               sample_word_q := Sample_In_Q(((lane_idx + 1) * G_DATA_WIDTH) - 1 downto lane_idx * G_DATA_WIDTH);
-              Frame_Buffer_R(sample_index).re <= resize(signed(sample_word_i), C_FFT_INTERNAL_WIDTH);
-              Frame_Buffer_R(sample_index).im <= resize(signed(sample_word_q), C_FFT_INTERNAL_WIDTH);
+              Input_Frame_R(sample_index).re <= resize(signed(sample_word_i), C_FFT_INTERNAL_WIDTH);
+              Input_Frame_R(sample_index).im <= resize(signed(sample_word_q), C_FFT_INTERNAL_WIDTH);
             end if;
           end loop;
 
           if Input_Word_Count_R = C_INPUT_WORDS - 1 then
-            Frame_Ready_R <= '1';
             Input_Word_Count_R <= 0;
+            Input_Frame_Ready_R <= '1';
           else
             Input_Word_Count_R <= Input_Word_Count_R + 1;
           end if;
         end if;
 
-        if Pipeline_State_R = S_IDLE and Frame_Ready_R = '1' then
-          Stage_Input_Frame_R <= fft_bit_reverse_permute(Frame_Buffer_R);
-          Stage_Input_Count_R <= 0;
-          Stage_Output_Count_R <= 0;
-          Current_Stage_R <= 0;
-          Pipeline_State_R <= S_STREAM_INPUT;
-          Frame_Ready_R <= '0';
+        -- Once a captured frame is ready and stage 0 isn't currently
+        -- being streamed into, kick off bit-reversed streaming into the
+        -- pipeline, one sample per cycle, gated on stage 0's ready signal.
+        if Input_Frame_Ready_R = '1' and Input_Streaming_R = '0' then
+          Input_Streaming_R <= '1';
+          Input_Stream_Count_R <= 0;
         end if;
 
-        if Pipeline_State_R = S_STREAM_INPUT then
-          if Stage_Input_Count_R < G_FFT_SIZE and Stage_Input_Ready_S(Current_Stage_R) = '1' then
-            Stage_Input_Sample_R(Current_Stage_R) <= Stage_Input_Frame_R(Stage_Input_Count_R);
-            Stage_Input_Valid_R(Current_Stage_R) <= '1';
-            if Stage_Input_Count_R = G_FFT_SIZE - 1 then
-              Stage_Input_Count_R <= 0;
-              Pipeline_State_R <= S_STREAM_OUTPUT;
-              Stage_Output_Count_R <= 0;
-            else
-              Stage_Input_Count_R <= Stage_Input_Count_R + 1;
-            end if;
+        if Input_Streaming_R = '1' and Stage_Ready(0) = '1' then
+          bitrev_frame_v := fft_bit_reverse_permute(Input_Frame_R);
+          Stage_Sample(0) <= bitrev_frame_v(Input_Stream_Count_R);
+          Stage_Valid(0) <= '1';
+          if Input_Stream_Count_R = G_FFT_SIZE - 1 then
+            Input_Stream_Count_R <= 0;
+            Input_Streaming_R <= '0';
+            Input_Frame_Ready_R <= '0';
+          else
+            Input_Stream_Count_R <= Input_Stream_Count_R + 1;
           end if;
         end if;
 
-        if Pipeline_State_R = S_STREAM_OUTPUT then
-          Stage_Output_Ready_R(Current_Stage_R) <= '1';
-          if Stage_Output_Valid_R(Current_Stage_R) = '1' then
-            Stage_Frame_R(Current_Stage_R)(Stage_Output_Count_R) <= Stage_Output_Sample_R(Current_Stage_R);
-            if Stage_Output_Count_R = G_FFT_SIZE - 1 then
-              if Current_Stage_R = C_STAGES - 1 then
-                Output_Frame_R <= Stage_Frame_R(Current_Stage_R);
-                Output_Sample_Count_R <= 0;
-                Output_Lane_Count_R <= 0;
-                Pipeline_State_R <= S_EMIT_OUTPUT;
-              else
-                Stage_Input_Frame_R <= Stage_Frame_R(Current_Stage_R);
-                Stage_Input_Count_R <= 0;
-                Current_Stage_R <= Current_Stage_R + 1;
-                Pipeline_State_R <= S_STREAM_INPUT;
-              end if;
-            else
-              Stage_Output_Count_R <= Stage_Output_Count_R + 1;
-            end if;
+        -- Pack samples emerging from the last pipeline stage directly
+        -- onto the wide output bus, G_SAMPLES_PER_CLK at a time.
+        if Stage_Valid(C_STAGES) = '1' then
+          if Output_Lane_Count_R = 0 then
+            Data_Out_I_R <= (others => '0');
+            Data_Out_Q_R <= (others => '0');
           end if;
-        end if;
 
-        if Pipeline_State_R = S_EMIT_OUTPUT then
-          if Output_Sample_Count_R < G_FFT_SIZE then
-            if Output_Lane_Count_R = 0 then
-              Data_Out_I_R <= (others => '0');
-              Data_Out_Q_R <= (others => '0');
-            end if;
+          Data_Out_I_R(((Output_Lane_Count_R + 1) * C_OUTPUT_WIDTH) - 1 downto Output_Lane_Count_R * C_OUTPUT_WIDTH) <=
+            std_logic_vector(fft_resize_saturate(Stage_Sample(C_STAGES).re, C_OUTPUT_WIDTH));
+          Data_Out_Q_R(((Output_Lane_Count_R + 1) * C_OUTPUT_WIDTH) - 1 downto Output_Lane_Count_R * C_OUTPUT_WIDTH) <=
+            std_logic_vector(fft_resize_saturate(Stage_Sample(C_STAGES).im, C_OUTPUT_WIDTH));
 
-            for lane_idx in 0 to G_SAMPLES_PER_CLK - 1 loop
-              sample_index := Output_Sample_Count_R + lane_idx;
-              if sample_index < G_FFT_SIZE then
-                Data_Out_I_R(((lane_idx + 1) * C_OUTPUT_WIDTH) - 1 downto lane_idx * C_OUTPUT_WIDTH) <= std_logic_vector(fft_resize_saturate(Output_Frame_R(sample_index).re, C_OUTPUT_WIDTH));
-                Data_Out_Q_R(((lane_idx + 1) * C_OUTPUT_WIDTH) - 1 downto lane_idx * C_OUTPUT_WIDTH) <= std_logic_vector(fft_resize_saturate(Output_Frame_R(sample_index).im, C_OUTPUT_WIDTH));
-              end if;
-            end loop;
+          if Output_Lane_Count_R = G_SAMPLES_PER_CLK - 1 then
+            Output_Lane_Count_R <= 0;
             Data_Out_V_R <= '1';
-
-            if Output_Sample_Count_R + G_SAMPLES_PER_CLK >= G_FFT_SIZE then
-              Output_Sample_Count_R <= 0;
-              Pipeline_State_R <= S_IDLE;
-            else
-              Output_Sample_Count_R <= Output_Sample_Count_R + G_SAMPLES_PER_CLK;
-            end if;
+          else
+            Output_Lane_Count_R <= Output_Lane_Count_R + 1;
           end if;
         end if;
       end if;
