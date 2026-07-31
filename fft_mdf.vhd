@@ -49,33 +49,22 @@ architecture rtl of fft_mdf is
 
   constant C_LOG2_N      : integer := integer(log2(real(G_FFT_SIZE)));
   constant C_STAGES      : integer := C_LOG2_N;
-  constant C_INPUT_WORDS : integer := (G_FFT_SIZE + G_SAMPLES_PER_CLK - 1) / G_SAMPLES_PER_CLK;
   constant C_OUTPUT_WIDTH : integer := G_SAMPLE_WIDTH + C_LOG2_N;
-  constant C_OUTPUT_WORDS : integer := (G_FFT_SIZE + G_SAMPLES_PER_CLK - 1) / G_SAMPLES_PER_CLK;
   constant C_STAGE_BUTTERFLY_LANES : integer := min_int(G_FFT_SIZE / 2, max_int(1, C_STAGES * G_SAMPLES_PER_CLK));
   constant C_ZERO_SAMPLE : t_complex_sample := ((others => '0'), (others => '0'));
   type t_logic_array is array (natural range <>) of std_logic;
 
-  -- C_STAGES pipelined fft_stage units are chained back to back below, each
-  -- with its own ping-pong buffering (see fft_stage.vhd), so that multiple
-  -- frames can be in flight concurrently -- one per stage -- instead of a
-  -- single state machine reusing one stage's hardware at a time. This
-  -- matches the continuous-flow, all-stages-active pipelined FFT model
-  -- described in Garrido's MDF architecture survey.
-  signal Stage_Sample     : t_complex_array(0 to C_STAGES) := (others => C_ZERO_SAMPLE);
-  signal Stage_Valid      : t_logic_array(0 to C_STAGES) := (others => '0');
-  signal Stage_Ready       : t_logic_array(0 to C_STAGES) := (others => '0');
+  signal Input_Lane_Index_R      : integer range 0 to G_SAMPLES_PER_CLK - 1 := 0;
+  signal Input_Word_Buffer_Valid_R : std_logic := '0';
 
-  signal Input_Word_Count_R     : integer range 0 to G_FFT_SIZE - 1 := 0;
-  signal Input_Frame_R          : t_complex_array(0 to G_FFT_SIZE - 1) := (others => C_ZERO_SAMPLE);
-  signal Input_Frame_Ready_R    : std_logic := '0';
-  signal Input_Stream_Count_R   : integer range 0 to G_FFT_SIZE - 1 := 0;
-  signal Input_Streaming_R      : std_logic := '0';
+  signal Stage_Sample           : t_complex_array(0 to C_STAGES) := (others => C_ZERO_SAMPLE);
+  signal Stage_Valid         : t_logic_array(0 to C_STAGES) := (others => '0');
+  signal Stage_Ready         : t_logic_array(0 to C_STAGES) := (others => '0');
 
-  signal Output_Lane_Count_R    : integer range 0 to G_SAMPLES_PER_CLK - 1 := 0;
-  signal Data_Out_I_R           : std_logic_vector(C_OUTPUT_WIDTH * G_SAMPLES_PER_CLK - 1 downto 0) := (others => '0');
-  signal Data_Out_Q_R           : std_logic_vector(C_OUTPUT_WIDTH * G_SAMPLES_PER_CLK - 1 downto 0) := (others => '0');
-  signal Data_Out_V_R           : std_logic := '0';
+  signal Output_Lane_Count_R : integer range 0 to G_SAMPLES_PER_CLK - 1 := 0;
+  signal Data_Out_I_R        : std_logic_vector(C_OUTPUT_WIDTH * G_SAMPLES_PER_CLK - 1 downto 0) := (others => '0');
+  signal Data_Out_Q_R        : std_logic_vector(C_OUTPUT_WIDTH * G_SAMPLES_PER_CLK - 1 downto 0) := (others => '0');
+  signal Data_Out_V_R        : std_logic := '0';
 
 begin
   assert G_FFT_SIZE > 0 report "G_FFT_SIZE must be greater than zero" severity failure;
@@ -117,87 +106,50 @@ begin
       );
   end generate;
 
-  -- The last stage's output is always accepted immediately: it feeds
-  -- straight into the output-emission logic below, which simply packs
-  -- each incoming sample onto the wide output bus lane by lane.
   Stage_Ready(C_STAGES) <= '1';
 
-  process(Clk)
-    variable sample_index         : integer;
-    variable sample_word_i        : std_logic_vector(G_DATA_WIDTH - 1 downto 0);
-    variable sample_word_q        : std_logic_vector(G_DATA_WIDTH - 1 downto 0);
-    variable bitrev_frame_v       : t_complex_array(0 to G_FFT_SIZE - 1);
+  input_proc : process(Clk)
+    variable sample_word_i : std_logic_vector(G_DATA_WIDTH - 1 downto 0);
+    variable sample_word_q : std_logic_vector(G_DATA_WIDTH - 1 downto 0);
   begin
     if rising_edge(Clk) then
       if Rst = '1' then
-        Input_Word_Count_R <= 0;
-        Input_Frame_R <= (others => C_ZERO_SAMPLE);
-        Input_Frame_Ready_R <= '0';
-        Input_Stream_Count_R <= 0;
-        Input_Streaming_R <= '0';
+        Input_Lane_Index_R <= 0;
         Stage_Valid(0) <= '0';
         Stage_Sample(0) <= C_ZERO_SAMPLE;
+      else
+        Stage_Valid(0) <= '0';
+
+        if Sample_In_V = '1' and Stage_Ready(0) = '1' then
+          sample_word_i := Sample_In_I(((Input_Lane_Index_R + 1) * G_DATA_WIDTH) - 1 downto Input_Lane_Index_R * G_DATA_WIDTH);
+          sample_word_q := Sample_In_Q(((Input_Lane_Index_R + 1) * G_DATA_WIDTH) - 1 downto Input_Lane_Index_R * G_DATA_WIDTH);
+
+          Stage_Sample(0).re <= resize(signed(sample_word_i), C_FFT_INTERNAL_WIDTH);
+          Stage_Sample(0).im <= resize(signed(sample_word_q), C_FFT_INTERNAL_WIDTH);
+          Stage_Valid(0) <= '1';
+
+          if Input_Lane_Index_R = G_SAMPLES_PER_CLK - 1 then
+            Input_Lane_Index_R <= 0;
+          else
+            Input_Lane_Index_R <= Input_Lane_Index_R + 1;
+          end if;
+        end if;
+      end if;
+    end if;
+  end process;
+
+  output_proc : process(Clk)
+  begin
+    if rising_edge(Clk) then
+      if Rst = '1' then
         Output_Lane_Count_R <= 0;
         Data_Out_I_R <= (others => '0');
         Data_Out_Q_R <= (others => '0');
         Data_Out_V_R <= '0';
       else
-        Stage_Valid(0) <= '0';
         Data_Out_V_R <= '0';
 
-        -- Capture an incoming frame into a local buffer, one word (of
-        -- G_SAMPLES_PER_CLK samples) per cycle. This can happen while a
-        -- previous frame is still being streamed into stage 0, as long as
-        -- that previous frame has already finished being copied into
-        -- Input_Frame_R (Input_Frame_Ready_R='0').
-        if Sample_In_V = '1' and Input_Frame_Ready_R = '0' then
-          for lane_idx in 0 to G_SAMPLES_PER_CLK - 1 loop
-            sample_index := Input_Word_Count_R * G_SAMPLES_PER_CLK + lane_idx;
-            if sample_index < G_FFT_SIZE then
-              sample_word_i := Sample_In_I(((lane_idx + 1) * G_DATA_WIDTH) - 1 downto lane_idx * G_DATA_WIDTH);
-              sample_word_q := Sample_In_Q(((lane_idx + 1) * G_DATA_WIDTH) - 1 downto lane_idx * G_DATA_WIDTH);
-              Input_Frame_R(sample_index).re <= resize(signed(sample_word_i), C_FFT_INTERNAL_WIDTH);
-              Input_Frame_R(sample_index).im <= resize(signed(sample_word_q), C_FFT_INTERNAL_WIDTH);
-            end if;
-          end loop;
-
-          if Input_Word_Count_R = C_INPUT_WORDS - 1 then
-            Input_Word_Count_R <= 0;
-            Input_Frame_Ready_R <= '1';
-          else
-            Input_Word_Count_R <= Input_Word_Count_R + 1;
-          end if;
-        end if;
-
-        -- Once a captured frame is ready and stage 0 isn't currently
-        -- being streamed into, kick off bit-reversed streaming into the
-        -- pipeline, one sample per cycle, gated on stage 0's ready signal.
-        if Input_Frame_Ready_R = '1' and Input_Streaming_R = '0' then
-          Input_Streaming_R <= '1';
-          Input_Stream_Count_R <= 0;
-        end if;
-
-        if Input_Streaming_R = '1' and Stage_Ready(0) = '1' then
-          bitrev_frame_v := fft_bit_reverse_permute(Input_Frame_R);
-          Stage_Sample(0) <= bitrev_frame_v(Input_Stream_Count_R);
-          Stage_Valid(0) <= '1';
-          if Input_Stream_Count_R = G_FFT_SIZE - 1 then
-            Input_Stream_Count_R <= 0;
-            Input_Streaming_R <= '0';
-            Input_Frame_Ready_R <= '0';
-          else
-            Input_Stream_Count_R <= Input_Stream_Count_R + 1;
-          end if;
-        end if;
-
-        -- Pack samples emerging from the last pipeline stage directly
-        -- onto the wide output bus, G_SAMPLES_PER_CLK at a time.
         if Stage_Valid(C_STAGES) = '1' then
-          if Output_Lane_Count_R = 0 then
-            Data_Out_I_R <= (others => '0');
-            Data_Out_Q_R <= (others => '0');
-          end if;
-
           Data_Out_I_R(((Output_Lane_Count_R + 1) * C_OUTPUT_WIDTH) - 1 downto Output_Lane_Count_R * C_OUTPUT_WIDTH) <=
             std_logic_vector(fft_resize_saturate(Stage_Sample(C_STAGES).re, C_OUTPUT_WIDTH));
           Data_Out_Q_R(((Output_Lane_Count_R + 1) * C_OUTPUT_WIDTH) - 1 downto Output_Lane_Count_R * C_OUTPUT_WIDTH) <=
